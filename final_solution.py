@@ -30,14 +30,14 @@ BLEND_WEIGHTS_REPORT_PATH = Path("blend_weights.csv")
 
 # Runtime profile for ~12h H100
 MULTI_FOLDS = 4
-OVR_FOLDS = 3
-MULTI_SEEDS = [42]
-OVR_SEEDS = [2026]
+OVR_FOLDS = 2
+MULTI_SEEDS = [42, 2027]
+OVR_SEEDS = [2026, 2027]
 
 # OvR target selection
 # rare_and_hard = ultra-rare by prevalence OR manually listed hard/high-impact targets
 OVR_TARGET_MODE = "rare_and_hard"  # one of: all, rare_only, rare_and_hard
-OVR_RARE_THRESHOLD = 0.01
+OVR_RARE_THRESHOLD = 0.006
 MANUAL_HARD_TARGETS = {
     "target_10_1", "target_9_6", "target_8_1", "target_3_1", "target_3_2",
     "target_7_1", "target_7_2", "target_9_7", "target_9_2", "target_8_2"
@@ -46,9 +46,9 @@ MANUAL_HARD_TARGETS = {
 # Blend controls
 AUTO_TUNE_BLEND_WEIGHT = True
 USE_PER_TARGET_BLEND = True
-MIN_OOF_GAIN_FOR_OVR = 0.0002
-BLEND_GRID = np.array([0.0, 0.15, 0.3, 0.5, 0.7, 0.85, 1.0])  # regularized grid to reduce overfit
-DEFAULT_BLEND_WEIGHT_MULTI = 0.8
+MIN_OOF_GAIN_FOR_OVR = 0.0010
+BLEND_GRID = np.array([0.5, 0.7, 0.85, 1.0])  # conservative grid to reduce public overfit
+DEFAULT_BLEND_WEIGHT_MULTI = 0.9
 
 # Feature hygiene
 DROP_CONST_FEATURES = True
@@ -70,6 +70,19 @@ def safe_auc(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     if np.unique(y_true).shape[0] < 2:
         return 0.5
     return float(roc_auc_score(y_true, y_pred))
+
+
+def rank_normalize_2d(x: np.ndarray) -> np.ndarray:
+    # AUC depends on order only; rank-normalization improves blend stability across folds/LB splits.
+    out = np.empty_like(x, dtype=np.float64)
+    n = x.shape[0]
+    denom = max(n - 1, 1)
+    for j in range(x.shape[1]):
+        order = np.argsort(x[:, j], kind="mergesort")
+        ranks = np.empty(n, dtype=np.float64)
+        ranks[order] = np.arange(n, dtype=np.float64)
+        out[:, j] = ranks / denom
+    return out
 
 
 def load_data(data_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -324,8 +337,8 @@ def find_best_blend_weight_per_target(
     y_arr = y_true.values
     n_targets = y_arr.shape[1]
 
-    p_multi = sigmoid(pred_multi_raw)
-    p_ovr = sigmoid(pred_ovr_raw)
+    p_multi = rank_normalize_2d(sigmoid(pred_multi_raw))
+    p_ovr = rank_normalize_2d(sigmoid(pred_ovr_raw))
 
     best_weights = np.ones(n_targets, dtype=np.float64)
     rows = []
@@ -354,8 +367,10 @@ def find_best_blend_weight_per_target(
                 best_auc_j = auc_j
                 best_w_j = float(w)
 
+        # shrink tuned weights toward Multi-only to reduce public LB overfit
+        best_w_j = max(0.7, 0.6 * 1.0 + 0.4 * best_w_j)
         best_weights[j] = best_w_j
-        rows.append({"target": target_names[j], "best_weight_multi": best_w_j, "oof_auc": best_auc_j, "ovr_used": int(best_w_j < 1.0)})
+        rows.append({"target": target_names[j], "best_weight_multi": best_w_j, "oof_auc": best_auc_j, "ovr_used": int(best_w_j < 0.999)})
 
     p_ovr_filled = np.where(np.isnan(p_ovr), p_multi, p_ovr)
     p_blend = p_multi * best_weights.reshape(1, -1) + p_ovr_filled * (1.0 - best_weights.reshape(1, -1))
@@ -419,8 +434,8 @@ def main() -> None:
         prevalence=prevalence,
     )
 
-    p_multi_test = sigmoid(test_multi_raw)
-    p_ovr_test = sigmoid(test_ovr_raw)
+    p_multi_test = rank_normalize_2d(sigmoid(test_multi_raw))
+    p_ovr_test = rank_normalize_2d(sigmoid(test_ovr_raw))
 
     if AUTO_TUNE_BLEND_WEIGHT and USE_PER_TARGET_BLEND:
         best_w_vec, macro_auc, report_df = find_best_blend_weight_per_target(
