@@ -56,6 +56,13 @@ DROP_NEAR_CONST_FEATURES = True
 NEAR_CONST_DOMINANCE_THRESHOLD = 0.9995
 MISSING_RATE_THRESHOLD = 0.997
 
+# Post-patch stage (extra quality push on weakest targets)
+ENABLE_WORST_TARGET_PATCH = True
+PATCH_TOP_K = 12
+PATCH_HOLDOUT_SIZE = 0.05
+PATCH_RANDOM_STATE = 42
+PATCH_BLEND_WEIGHT = 0.2
+
 
 def sigmoid(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-x))
@@ -379,6 +386,83 @@ def find_best_blend_weight_per_target(
     return best_weights, float(macro_auc), pd.DataFrame(rows)
 
 
+
+def split_holdout_indices(n_rows: int, test_size: float, random_state: int) -> Tuple[np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(random_state)
+    idx = np.arange(n_rows)
+    rng.shuffle(idx)
+    n_val = int(n_rows * test_size)
+    val_idx = idx[:n_val]
+    tr_idx = idx[n_val:]
+    return tr_idx, val_idx
+
+
+def select_worst_targets(y_true: pd.DataFrame, pred_raw: np.ndarray, target_cols: List[str], top_k: int) -> List[str]:
+    p = rank_normalize_2d(sigmoid(pred_raw))
+    aucs = []
+    y_arr = y_true.values
+    for j, t in enumerate(target_cols):
+        aucs.append((t, safe_auc(y_arr[:, j], p[:, j])))
+    aucs.sort(key=lambda x: x[1])
+    worst = [t for t, _ in aucs[:top_k]]
+    print(f"Patch stage worst targets ({len(worst)}): {worst}")
+    return worst
+
+
+def patch_worst_targets(
+    x_train: pd.DataFrame,
+    y_train: pd.DataFrame,
+    x_test: pd.DataFrame,
+    cat_indices: List[int],
+    target_cols: List[str],
+    base_test_prob: np.ndarray,
+    patch_targets: List[str],
+) -> np.ndarray:
+    patched = base_test_prob.copy()
+    tr_idx, va_idx = split_holdout_indices(x_train.shape[0], PATCH_HOLDOUT_SIZE, PATCH_RANDOM_STATE)
+
+    x_tr, x_va = x_train.iloc[tr_idx], x_train.iloc[va_idx]
+    test_pool = Pool(x_test, cat_features=cat_indices)
+
+    for t in patch_targets:
+        j = target_cols.index(t)
+        y_col = y_train[t].values
+        y_tr, y_va = y_col[tr_idx], y_col[va_idx]
+
+        prev = float(y_col.mean())
+        params = ovr_params_for_target(prev)
+        print(f"[PATCH] {t} prev={prev:.4f} params={params}")
+
+        model = CatBoostClassifier(
+            loss_function="Logloss",
+            eval_metric="AUC",
+            iterations=int(params["iterations"]),
+            learning_rate=float(params["learning_rate"]),
+            depth=int(params["depth"]),
+            l2_leaf_reg=float(params["l2_leaf_reg"]),
+            random_strength=1.0,
+            bagging_temperature=0.7,
+            border_count=254,
+            bootstrap_type="Bayesian",
+            leaf_estimation_iterations=5,
+            od_type="Iter",
+            od_wait=int(params["od_wait"]),
+            auto_class_weights="Balanced",
+            random_seed=2028,
+            task_type="GPU",
+            verbose=200,
+        )
+
+        train_pool = Pool(x_tr, label=y_tr, cat_features=cat_indices)
+        valid_pool = Pool(x_va, label=y_va, cat_features=cat_indices)
+        model.fit(train_pool, eval_set=valid_pool, use_best_model=True)
+
+        patch_prob = sigmoid(model.predict(test_pool, prediction_type="RawFormulaVal").reshape(-1))
+        patched[:, j] = (1.0 - PATCH_BLEND_WEIGHT) * patched[:, j] + PATCH_BLEND_WEIGHT * patch_prob
+
+    return patched
+
+
 def build_submission(sample_submit: pd.DataFrame, preds: np.ndarray, out_path: Path) -> None:
     sub = sample_submit.copy()
     sub.iloc[:, 1:] = preds
@@ -453,6 +537,18 @@ def main() -> None:
     else:
         p_ovr_filled_test = np.where(np.isnan(p_ovr_test), p_multi_test, p_ovr_test)
         p_blend_test = DEFAULT_BLEND_WEIGHT_MULTI * p_multi_test + (1.0 - DEFAULT_BLEND_WEIGHT_MULTI) * p_ovr_filled_test
+
+    if ENABLE_WORST_TARGET_PATCH:
+        patch_targets = select_worst_targets(y_train, oof_multi_raw, target_cols, PATCH_TOP_K)
+        p_blend_test = patch_worst_targets(
+            x_train=x_train,
+            y_train=y_train,
+            x_test=x_test,
+            cat_indices=cat_indices,
+            target_cols=target_cols,
+            base_test_prob=p_blend_test,
+            patch_targets=patch_targets,
+        )
 
     pred_final = logit(p_blend_test)
     build_submission(sample_submit, pred_final, OUTPUT_PATH)
